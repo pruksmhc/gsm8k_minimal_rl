@@ -186,7 +186,7 @@ def run_grpo_rollout_on_gsm8k(
         max_batches: Maximum number of batches to process
         verbose: Whether to print detailed information
     """
-    from generate_rollouts import grpo_rollout_demo, simple_length_reward
+    from generate_rollouts import grpo_rollout_demo
     
     print("🚀 Running GRPO Rollout Demo on GSM8K Test Dataset")
     
@@ -194,27 +194,9 @@ def run_grpo_rollout_on_gsm8k(
     print("Loading GSM8K test dataset...")
     gsm8k_dataset = get_gsm8k_questions(split="test")
     
-    # Convert GSM8K format to chat format for rollout demo
-    def convert_gsm8k_to_rollout_format(examples):
-        prompts = []
-        answers = []
-        for example in examples:
-            # Keep the chat format instead of flattening
-            prompts.append(example["prompt"])
-            answers.append(example["answer"])
-        
-        return {"prompt": prompts, "answer": answers}
-    
-    # Convert dataset format
-    rollout_dataset = Dataset.from_dict(
-        convert_gsm8k_to_rollout_format(gsm8k_dataset)
-    )
-    
-    print(f"Converted {len(rollout_dataset)} GSM8K examples for rollout demo")
-    
     # Run the rollout demo
     results = grpo_rollout_demo(
-        dataset=rollout_dataset,
+        dataset=gsm8k_dataset,
         model=model,
         tokenizer=tokenizer,
         prompt_column="prompt",
@@ -228,7 +210,6 @@ def run_grpo_rollout_on_gsm8k(
         log_file=output_dir,
         log_format="jsonl",
         reward_funcs=[correctness_reward_func, soft_format_reward_func],
-        reward_processing_classes=None  # Custom functions don't need tokenizers
     )
     
     print(f"\n✅ GSM8K GRPO Rollout Complete!")
@@ -266,38 +247,38 @@ def main():
     
     args = parser.parse_args()
     
-        
     # Load model and tokenizer
-    if args.checkpoint_dir and os.path.exists(args.checkpoint_dir):
-        print(f"Loading model from checkpoint: {args.checkpoint_dir}")
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        print(f"Loading model from checkpoint: {args.checkpoint}")
         model = AutoModelForCausalLM.from_pretrained(
-            args.checkpoint_dir,
+            args.checkpoint,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map=None
         ).to("cuda")
-        tokenizer = AutoTokenizer.from_pretrained(args.checkpoint_dir)
+        tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     else:
-        print(f"Loading model: {args.model_name}")
+        print(f"Loading model: {args.model}")
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map=None
         ).to("cuda")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
+    
     if args.mode == "train":
         print("Starting training mode...")
-        train_model_from_scratch(model, tokenizer, output_dir=args.output_dir)
+        train_model_from_scratch(model, tokenizer, output_dir=args.output_dir, per_device_batch_size=args.per_device_batch_size)
     elif args.mode == "rollout":
         print("Starting GRPO rollout demo mode...")
         run_grpo_rollout_on_gsm8k(
             model, 
-            checkpoint_dir=args.checkpoint,
+            tokenizer,
+            per_device_batch_size=args.per_device_batch_size,
             max_batches=args.max_batches,
             num_generations=args.num_generations,
             verbose=True, 

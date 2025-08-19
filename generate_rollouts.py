@@ -207,28 +207,28 @@ def grpo_rollout_demo(
             
             if verbose:
                 print(f"Batch size: {len(prompts)}")
-            
             # Analyze the duplication pattern
-            unique_prompts = list(dict.fromkeys(prompts))  # Preserve order, remove duplicates
-            
-            if verbose:
-                print(f"Unique prompts in batch: {len(unique_prompts)}")
-                for i, prompt in enumerate(unique_prompts):
-                    count = prompts.count(prompt)
-                    print(f"  {i+1}. '{prompt[:50]}...' (repeated {count} times)")
+            if not is_conversational(batch[0]):
+                unique_prompts = list(dict.fromkeys(prompts))  # Preserve order, remove duplicates
+                
+                if verbose:
+                    print(f"Unique prompts in batch: {len(unique_prompts)}")
+                    for i, prompt in enumerate(unique_prompts):
+                        count = prompts.count(prompt)
+                        print(f"  {i+1}. '{prompt[:50]}...' (repeated {count} times)")
             
             # Handle both string prompts and chat format using TRL utilities
             # Check if any prompt in the batch is conversational
             sample_item = batch[0] if batch else {}
             if is_conversational(sample_item):
                 # Apply chat template to each prompt
-                tokenized_prompts = []
+                formatted_prompts = []
                 for item in batch:
                     formatted = maybe_apply_chat_template(item, tokenizer)
-                    tokenized_prompts.append(formatted["prompt"])
+                    formatted_prompts.append(formatted["prompt"])
                 
                 prompt_inputs = tokenizer(
-                    tokenized_prompts,
+                    formatted_prompts,
                     return_tensors="pt",
                     padding=True,
                     padding_side="left",  # GRPO uses left padding
