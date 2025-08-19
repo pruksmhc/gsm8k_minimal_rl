@@ -14,10 +14,9 @@ from transformers import (
 )
 from datasets import Dataset
 from trl.trainer.grpo_trainer import RepeatSampler
-from trl.data_utils import maybe_apply_chat_template, is_conversational, apply_chat_template
+from trl.data_utils import maybe_apply_chat_template, is_conversational
 
-# Type definition for reward functions (matching GRPO)
-from typing import Dict, List, Tuple, Any, Optional, Union, Callable
+from typing import Dict, List, Any, Optional, Union, Callable
 import json
 import os
 from datetime import datetime
@@ -30,6 +29,7 @@ def grpo_rollout_demo(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     prompt_column: str = "prompt",
+    prompt_id_column: str = "question",  # Can be same as prompt_column, is the un-templated prompt before conversation templating. 
     num_generations: int = 4,
     per_device_batch_size: int = 1,
     steps_per_generation: int = 2,
@@ -203,20 +203,19 @@ def grpo_rollout_demo(
                 print(f"\n--- Batch {batch_idx + 1} ---")
             
             # Extract prompts from the specified column
-            prompts = [item[prompt_column] for item in batch]
+            maybe_conversational_prompts = [item[prompt_column] for item in batch]
+            prompt_ids = [item[prompt_id_column] for item in batch]
+            if verbose:
+                print(f"Batch size: {len(maybe_conversational_prompts)}")
+            # Analyze the duplication pattern
+            unique_prompts = list(dict.fromkeys(prompt_ids))  # Preserve order, remove duplicates
             
             if verbose:
-                print(f"Batch size: {len(prompts)}")
-            # Analyze the duplication pattern
-            if not is_conversational(batch[0]):
-                unique_prompts = list(dict.fromkeys(prompts))  # Preserve order, remove duplicates
-                
-                if verbose:
-                    print(f"Unique prompts in batch: {len(unique_prompts)}")
-                    for i, prompt in enumerate(unique_prompts):
-                        count = prompts.count(prompt)
-                        print(f"  {i+1}. '{prompt[:50]}...' (repeated {count} times)")
-            
+                print(f"Unique prompts in batch: {len(unique_prompts)}")
+                for i, prompt in enumerate(unique_prompts):
+                    count = prompt_ids.count(prompt)
+                    print(f"  {i+1}. '{prompt[:50]}...' (repeated {count} times)")
+        
             # Handle both string prompts and chat format using TRL utilities
             # Check if any prompt in the batch is conversational
             sample_item = batch[0] if batch else {}
@@ -238,7 +237,7 @@ def grpo_rollout_demo(
             else:
                 # String format - tokenize directly
                 prompt_inputs = tokenizer(
-                    prompts,
+                    maybe_conversational_prompts,
                     return_tensors="pt",
                     padding=True,
                     padding_side="left",  # GRPO uses left padding
@@ -271,10 +270,14 @@ def grpo_rollout_demo(
                 print(f"Generated completions shape: {completion_ids.shape}")
             
             # Decode completions
-            completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-            
+            completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+            if is_conversational(sample_item):
+                completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
+            else:
+                completions = completions_text
+
             # Store results
-            all_prompts.extend(prompts)
+            all_prompts.extend(maybe_conversational_prompts)
             all_completions.extend(completions)
             
             # Group completions by unique prompt
@@ -284,10 +287,11 @@ def grpo_rollout_demo(
             for unique_prompt in unique_prompts:
                 prompt_completions = []
                 batch_examples = []  # Store full dataset examples for this prompt
-                for j, prompt in enumerate(prompts):
+                for j, prompt in enumerate(prompt_ids):
                     if prompt == unique_prompt:
                         prompt_completions.append(completions[j])
                         batch_examples.append(batch[j])  # Store the full example from the dataset
+                        maybe_templated_prompt = maybe_conversational_prompts[j]
                 batch_completion_groups[unique_prompt] = prompt_completions
                 
                 # Add to global completion groups
@@ -298,7 +302,7 @@ def grpo_rollout_demo(
                 # Calculate rewards if reward functions are provided
                 if processed_reward_funcs:
                     prompt_rewards = _calculate_rewards(
-                        unique_prompt, 
+                        maybe_templated_prompt,
                         prompt_completions, 
                         processed_reward_funcs, 
                         reward_func_names,
@@ -326,14 +330,10 @@ def grpo_rollout_demo(
                 )
             
             # Calculate batch statistics
-            completion_lengths = [len(comp.split()) for comp in completions]
             batch_stats.append({
                 'batch_idx': batch_idx,
-                'num_prompts': len(prompts),
+                'num_prompts': len(maybe_conversational_prompts),
                 'num_unique_prompts': len(unique_prompts),
-                'avg_completion_length': sum(completion_lengths) / len(completion_lengths),
-                'min_completion_length': min(completion_lengths),
-                'max_completion_length': max(completion_lengths)
             })
             
             if verbose:
@@ -346,11 +346,6 @@ def grpo_rollout_demo(
                     for k, completion in enumerate(prompt_completions):
                         print(f"   Completion {k+1}: '{completion[:100]}...'")
                 
-                # Show batch stats
-                stats = batch_stats[-1]
-                print(f"\n📊 Batch {batch_idx + 1} Stats:")
-                print(f"  Average completion length: {stats['avg_completion_length']:.1f} words")
-                print(f"  Min/Max completion length: {stats['min_completion_length']}/{stats['max_completion_length']} words")
     
     # Calculate mean rewards per unique prompt
     mean_reward_scores = {}
@@ -481,7 +476,6 @@ def _calculate_rewards(
             rewards_per_func[reward_func_name] = mean_reward
             
         except Exception as e:
-            breakpoint()
             if verbose:
                 print(f"⚠️  Error computing reward with {reward_func_name}: {e}")
             rewards_per_func[reward_func_name] = None
@@ -510,8 +504,6 @@ def _log_completions_to_file(
                     "completion_idx": i,
                     "completion": completion,
                     "timestamp": datetime.now().isoformat(),
-                    "completion_length_words": len(completion.split()),
-                    "completion_length_chars": len(completion)
                 }
                 if reward_scores:
                     entry["reward_scores"] = reward_scores
@@ -527,8 +519,6 @@ def _log_completions_to_file(
                     "completion_idx": i,
                     "completion": completion,
                     "timestamp": datetime.now().isoformat(),
-                    "completion_length_words": len(completion.split()),
-                    "completion_length_chars": len(completion)
                 }
                 if reward_scores:
                     entry["reward_scores"] = reward_scores
@@ -544,7 +534,6 @@ def _log_completions_to_file(
             f.write("-" * 60 + "\n")
             for i, completion in enumerate(completions):
                 f.write(f"COMPLETION {i + 1}: {completion}\n")
-                f.write(f"Length: {len(completion.split())} words, {len(completion)} chars\n\n")
             f.write("=" * 80 + "\n\n")
 
 
@@ -581,6 +570,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prompt_column="prompt",
+        prompt_id_column="prompt",
         num_generations=4,
         per_device_batch_size=1,
         steps_per_generation=2,

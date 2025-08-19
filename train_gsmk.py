@@ -1,10 +1,12 @@
-# train_grpo.py
-#
-# See https://github.com/willccbb/verifiers for ongoing developments
-#
+"""GSMK Training Script for GRPO
+
+Example usage:
+python3 train_gsmk.py --mode rollout --output_dir output --per_device_batch_size 64 # a40
+"""
 
 import os
 import re
+from typing import Any, List
 import torch
 import argparse
 from datasets import load_dataset, Dataset
@@ -43,26 +45,20 @@ def extract_hash_answer(text: str) -> str | None:
         return None
     return text.split("####")[1].strip().replace(",", "").replace("$", "")
 
-# uncomment middle messages for 1-shot prompting
-def get_gsm8k_questions(split = "train") -> Dataset:
-    data = load_dataset('openai/gsm8k', 'main')[split] # type: ignore
-    data = data.map(lambda x: { # type: ignore
+def get_gsm8k_questions(split="train") -> Dataset:
+    data = load_dataset('openai/gsm8k', 'main')[split]
+    data = data.map(lambda x: {
         'prompt': [
             {'role': 'system', 'content': SYSTEM_PROMPT},
-            #{'role': 'user', 'content': 'What is the largest single-digit prime number?'},
-            #{'role': 'assistant', 'content': XML_COT_FORMAT.format(
-            #    reasoning="9 is divisble by 3 and 8 is divisible by 2, but 7 is prime.",
-            #    answer="7"
-            #)},
             {'role': 'user', 'content': x['question']}
         ],
         'answer': extract_hash_answer(x['answer'])
-    }) # type: ignore
-    return data # type: ignore
+    })
+    return data
 
 
 # Reward functions
-def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
+def correctness_reward_func(prompts: List[List[Any]], completions: List[List[Any]], answer: List[int], **kwargs) -> list[float]:
     responses = [completion[0]['content'] for completion in completions]
     q = prompts[0][-1]['content']
     extracted_responses = [extract_xml_answer(r) for r in responses]
@@ -106,34 +102,21 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     contents = [completion[0]["content"] for completion in completions]
     return [count_xml(c) for c in contents]
 
-def train_model_from_scratch(model, tokenizer, output_dir=None, per_device_train_batch_size: int = 32):
+def train_model_from_scratch(model, tokenizer, run_name, output_dir=None, per_device_train_batch_size: int = 32):
     dataset = get_gsm8k_questions()
-    
-    if model_name is None:
-        model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-
-    if output_dir is None:
-        if "Llama" in model_name:
-            output_dir = "outputs/Llama-1B-GRPO"
-            run_name = "Llama-1B-GRPO-gsm8k"
-        else:
-            output_dir="outputs/Qwen-1.5B-GRPO"
-            run_name="Qwen-1.5B-GRPO-gsm8k"
-    else:
-        run_name = os.path.basename(output_dir)
         
     training_args = GRPOConfig(
         output_dir=output_dir,
         run_name=run_name,
         learning_rate=5e-6,
-        adam_beta1 = 0.9,
-        adam_beta2 = 0.99,
-        weight_decay = 0.1,
-        warmup_ratio = 0.1,
+        adam_beta1=0.9,
+        adam_beta2=0.99,
+        weight_decay=0.1,
+        warmup_ratio=0.1,
         lr_scheduler_type='cosine',
         logging_steps=1,
         bf16=True,
-        per_device_train_batch_size=per_device_train_batch_size, # in h100 
+        per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=8,
         num_generations=16,
         max_prompt_length=256,
@@ -247,7 +230,20 @@ def main():
     
     args = parser.parse_args()
     
-    # Load model and tokenizer
+    from datetime import datetime
+    timestamp = datetime.now().isoformat()
+    
+    if args.output_dir is None:
+        if "Llama" in args.model:
+            output_dir = "outputs/Llama-1B-GRPO"
+            run_name = f"Llama-1B-GRPO-gsm8k-{timestamp}"
+        else:
+            output_dir = "outputs/Qwen-1.5B-GRPO"
+            run_name = f"Qwen-1.5B-GRPO-gsm8k-{timestamp}"
+    else:
+        output_dir = args.output_dir
+        run_name = os.path.basename(output_dir)
+
     if args.checkpoint and os.path.exists(args.checkpoint):
         print(f"Loading model from checkpoint: {args.checkpoint}")
         model = AutoModelForCausalLM.from_pretrained(
@@ -260,7 +256,7 @@ def main():
     else:
         print(f"Loading model: {args.model}")
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
+            args.model,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map=None
@@ -272,9 +268,10 @@ def main():
     
     if args.mode == "train":
         print("Starting training mode...")
-        train_model_from_scratch(model, tokenizer, output_dir=args.output_dir, per_device_batch_size=args.per_device_batch_size)
+        train_model_from_scratch(model, tokenizer, run_name, output_dir=output_dir, per_device_train_batch_size=args.per_device_batch_size)
     elif args.mode == "rollout":
         print("Starting GRPO rollout demo mode...")
+        assert args.output_dir, "Please pass in output dir as the path to jsonl that you would like the rollouts to go to."
         run_grpo_rollout_on_gsm8k(
             model, 
             tokenizer,
