@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""
+Utils function for demonstrating GRPO RepeatSampler with any HuggingFace dataset,
+model, and tokenizer.
+"""
+
+import torch
+from torch.utils.data import DataLoader
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    GenerationConfig,
+    set_seed
+)
+from datasets import Dataset
+from trl.trainer.grpo_trainer import RepeatSampler
+from trl.data_utils import maybe_apply_chat_template, is_conversational, apply_chat_template
+
+# Type definition for reward functions (matching GRPO)
+from typing import Dict, List, Tuple, Any, Optional, Union, Callable
+import json
+import os
+from datetime import datetime
+import torch.nn as nn
+
+RewardFunc = Union[str, nn.Module, Callable[[List[str], List[str]], List[float]]]
+
+def grpo_rollout_demo(
+    dataset: Dataset,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt_column: str = "prompt",
+    num_generations: int = 4,
+    per_device_batch_size: int = 1,
+    steps_per_generation: int = 2,
+    max_completion_length: int = 50,
+    temperature: float = 0.8,
+    top_p: float = 0.9,
+    seed: int = 42,
+    max_batches: int = 1,
+    verbose: bool = True,
+    log_file: Optional[str] = None,
+    log_format: str = "jsonl",
+    reward_funcs: Optional[Union[RewardFunc, List[RewardFunc]]] = None,
+) -> Dict[str, Any]:
+    """
+    Demonstrate GRPO rollout strategy using RepeatSampler.
+    
+    Args:
+        dataset: HuggingFace Dataset containing prompts
+        model: Pre-trained causal language model
+        tokenizer: Tokenizer corresponding to the model
+        prompt_column: Column name containing prompts in the dataset
+        num_generations: Number of completions per prompt (like GRPO's num_generations)
+        per_device_batch_size: Batch size per device (like GRPO's per_device_train_batch_size)
+        steps_per_generation: Number of training steps per generation (like GRPO's steps_per_generation)
+        max_completion_length: Maximum length of generated completions
+        temperature: Sampling temperature for generation
+        top_p: Nucleus sampling parameter
+        seed: Random seed for reproducibility
+        max_batches: Maximum number of batches to process (for demo purposes)
+        verbose: Whether to print detailed information
+        log_file: Path to file for logging completions. If None, auto-generates filename
+        log_format: Format for logging ("jsonl", "json", or "txt")
+        reward_funcs: Optional reward functions (str model path, nn.Module, or callable)
+        
+    Returns:
+        Dict containing:
+        - prompts: List of all prompts processed
+        - completions: List of all generated completions
+        - completion_groups: Dict mapping prompt to its completions
+        - reward_scores: Dict mapping prompt to mean reward scores per function
+        - stats: Generation statistics
+        - log_file_path: Path to the generated log file
+    """
+    
+    if verbose:
+        print("🚀 GRPO RepeatSampler Rollout Demo")
+        print(f"Dataset size: {len(dataset)}")
+        print(f"Num generations per prompt: {num_generations}")
+        print(f"Steps per generation: {steps_per_generation}")
+        print(f"Temperature: {temperature}")
+        print("-" * 50)
+    
+    # Set up logging file
+    if log_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = getattr(model.config, '_name_or_path', 'unknown_model').split('/')[-1]
+        log_file = f"grpo_completions_{model_name}_{timestamp}.{log_format}"
+    
+    log_file_path = os.path.abspath(log_file)
+    
+    if verbose:
+        print(f"📝 Logging completions to: {log_file_path}")
+        print(f"Log format: {log_format}")
+    
+    # Validate log format
+    if log_format not in ["jsonl", "json", "txt"]:
+        raise ValueError(f"log_format must be one of ['jsonl', 'json', 'txt'], got '{log_format}'")
+    
+    # Initialize log file
+    if log_format == "json":
+        log_data = {
+            "metadata": {
+                "model_name": getattr(model.config, '_name_or_path', 'unknown_model'),
+                "timestamp": datetime.now().isoformat(),
+                "num_generations": num_generations,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_completion_length": max_completion_length,
+                "seed": seed
+            },
+            "completions": []
+        }
+    elif log_format == "txt":
+        with open(log_file_path, 'w', encoding='utf-8') as f:
+            f.write(f"GRPO Completions Log\n")
+            f.write(f"Model: {getattr(model.config, '_name_or_path', 'unknown_model')}\n")
+            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            f.write(f"Num generations: {num_generations}, Temperature: {temperature}\n")
+            f.write("=" * 80 + "\n\n")
+    
+    # Set seed for reproducibility
+    set_seed(seed)
+    
+    # Ensure pad token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        if verbose:
+            print(f"Set pad_token to eos_token: {tokenizer.eos_token}")
+    
+    # Validate dataset has the required column
+    if prompt_column not in dataset.column_names:
+        raise ValueError(f"Dataset must contain column '{prompt_column}'. Available columns: {dataset.column_names}")
+    
+    # Create RepeatSampler (the core GRPO component)
+    sampler = RepeatSampler(
+        data_source=dataset,
+        mini_repeat_count=num_generations,      # Repeat each prompt num_generations times
+        batch_size=per_device_batch_size,       # Unique prompts per batch
+        repeat_count=steps_per_generation,      # Repeat the whole process
+        shuffle=True,
+        seed=seed
+    )
+    
+    if verbose:
+        print(f"RepeatSampler will produce {len(sampler)} total samples")
+    
+    # Create DataLoader with GRPO's modified batch size
+    generation_batch_size = per_device_batch_size * steps_per_generation
+    dataloader = DataLoader(
+        dataset,
+        batch_size=generation_batch_size * num_generations,  # Key GRPO modification
+        sampler=sampler,
+        collate_fn=lambda x: x  # No collation, keep as list
+    )
+    
+    # Generation configuration
+    generation_config = GenerationConfig(
+        max_new_tokens=max_completion_length,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    
+    # Prepare reward functions (similar to GRPO initialization)
+    reward_func_names = []
+    processed_reward_funcs = []
+    
+    if reward_funcs is not None:
+        if not isinstance(reward_funcs, list):
+            reward_funcs = [reward_funcs]
+        
+        # Process each reward function
+        for i, reward_func in enumerate(reward_funcs):
+                # Custom callable reward function
+                processed_reward_funcs.append(reward_func)
+                reward_func_names.append(getattr(reward_func, '__name__', f'custom_reward_{i}'))
+        
+        if verbose:
+            print(f"🎯 Loaded {len(processed_reward_funcs)} reward functions: {reward_func_names}")
+    
+    # Storage for results
+    all_prompts = []
+    all_completions = []
+    completion_groups = {}
+    reward_scores = {}  # Maps prompt to dict of reward function scores
+    batch_stats = []
+    
+    if verbose:
+        print("\n📋 Processing batches...")
+    
+    # Process batches
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+                
+            if verbose:
+                print(f"\n--- Batch {batch_idx + 1} ---")
+            
+            # Extract prompts from the specified column
+            prompts = [item[prompt_column] for item in batch]
+            
+            if verbose:
+                print(f"Batch size: {len(prompts)}")
+            
+            # Analyze the duplication pattern
+            unique_prompts = list(dict.fromkeys(prompts))  # Preserve order, remove duplicates
+            
+            if verbose:
+                print(f"Unique prompts in batch: {len(unique_prompts)}")
+                for i, prompt in enumerate(unique_prompts):
+                    count = prompts.count(prompt)
+                    print(f"  {i+1}. '{prompt[:50]}...' (repeated {count} times)")
+            
+            # Handle both string prompts and chat format using TRL utilities
+            # Check if any prompt in the batch is conversational
+            sample_item = batch[0] if batch else {}
+            if is_conversational(sample_item):
+                # Apply chat template to each prompt
+                tokenized_prompts = []
+                for item in batch:
+                    formatted = maybe_apply_chat_template(item, tokenizer)
+                    tokenized_prompts.append(formatted["prompt"])
+                
+                prompt_inputs = tokenizer(
+                    tokenized_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",  # GRPO uses left padding
+                    truncation=True,
+                    add_special_tokens=False
+                )
+            else:
+                # String format - tokenize directly
+                prompt_inputs = tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",  # GRPO uses left padding
+                    truncation=True,
+                    add_special_tokens=False
+                )
+            
+            # Move inputs to same device as model
+            device = next(model.parameters()).device
+            prompt_inputs = {k: v.to(device) for k, v in prompt_inputs.items()}
+            
+            if verbose:
+                print(f"Tokenized input shape: {prompt_inputs['input_ids'].shape}")
+            
+            # Generate completions (single call for all duplicated prompts)
+            if verbose:
+                print("🔄 Generating completions...")
+            
+            generated_ids = model.generate(
+                **prompt_inputs,
+                generation_config=generation_config,
+                disable_compile=True
+            )
+            
+            # Extract completion parts
+            prompt_length = prompt_inputs['input_ids'].size(1)
+            completion_ids = generated_ids[:, prompt_length:]
+            
+            if verbose:
+                print(f"Generated completions shape: {completion_ids.shape}")
+            
+            # Decode completions
+            completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+            
+            # Store results
+            all_prompts.extend(prompts)
+            all_completions.extend(completions)
+            
+            # Group completions by unique prompt
+            batch_completion_groups = {}
+            batch_reward_scores = {}
+            
+            for unique_prompt in unique_prompts:
+                prompt_completions = []
+                batch_examples = []  # Store full dataset examples for this prompt
+                for j, prompt in enumerate(prompts):
+                    if prompt == unique_prompt:
+                        prompt_completions.append(completions[j])
+                        batch_examples.append(batch[j])  # Store the full example from the dataset
+                batch_completion_groups[unique_prompt] = prompt_completions
+                
+                # Add to global completion groups
+                if unique_prompt not in completion_groups:
+                    completion_groups[unique_prompt] = []
+                completion_groups[unique_prompt].extend(prompt_completions)
+                
+                # Calculate rewards if reward functions are provided
+                if processed_reward_funcs:
+                    prompt_rewards = _calculate_rewards(
+                        unique_prompt, 
+                        prompt_completions, 
+                        processed_reward_funcs, 
+                        reward_func_names,
+                        inputs=batch_examples,  # Pass the full dataset examples
+                        verbose=verbose
+                    )
+                    batch_reward_scores[unique_prompt] = prompt_rewards
+                    
+                    # Add to global reward scores
+                    if unique_prompt not in reward_scores:
+                        reward_scores[unique_prompt] = {name: [] for name in reward_func_names}
+                    
+                    for func_name, score in prompt_rewards.items():
+                        reward_scores[unique_prompt][func_name].append(score)
+                
+                # Log completions to file (now includes rewards if available)
+                _log_completions_to_file(
+                    unique_prompt, 
+                    prompt_completions, 
+                    log_file_path, 
+                    log_format, 
+                    batch_idx,
+                    log_data if log_format == "json" else None,
+                    batch_reward_scores.get(unique_prompt, {})
+                )
+            
+            # Calculate batch statistics
+            completion_lengths = [len(comp.split()) for comp in completions]
+            batch_stats.append({
+                'batch_idx': batch_idx,
+                'num_prompts': len(prompts),
+                'num_unique_prompts': len(unique_prompts),
+                'avg_completion_length': sum(completion_lengths) / len(completion_lengths),
+                'min_completion_length': min(completion_lengths),
+                'max_completion_length': max(completion_lengths)
+            })
+            
+            if verbose:
+                # Show results for this batch
+                print("\n📝 Generated Completions:")
+                for i, unique_prompt in enumerate(unique_prompts):
+                    print(f"\n🎯 Prompt {i+1}: '{unique_prompt[:70]}...'")
+                    
+                    prompt_completions = batch_completion_groups[unique_prompt]
+                    for k, completion in enumerate(prompt_completions):
+                        print(f"   Completion {k+1}: '{completion[:100]}...'")
+                
+                # Show batch stats
+                stats = batch_stats[-1]
+                print(f"\n📊 Batch {batch_idx + 1} Stats:")
+                print(f"  Average completion length: {stats['avg_completion_length']:.1f} words")
+                print(f"  Min/Max completion length: {stats['min_completion_length']}/{stats['max_completion_length']} words")
+    
+    # Calculate mean rewards per unique prompt
+    mean_reward_scores = {}
+    if reward_scores:
+        for prompt, func_scores in reward_scores.items():
+            mean_reward_scores[prompt] = {}
+            for func_name, scores in func_scores.items():
+                if scores:  # Only if we have scores
+                    mean_reward_scores[prompt][func_name] = sum(scores) / len(scores)
+                else:
+                    mean_reward_scores[prompt][func_name] = None
+    
+    # Finalize logging
+    if log_format == "json":
+        # Add reward summary to JSON log
+        if mean_reward_scores:
+            log_data["reward_summary"] = mean_reward_scores
+        with open(log_file_path, 'w', encoding='utf-8') as f:
+            json.dump(log_data, f, indent=2, ensure_ascii=False)
+    
+    if verbose:
+        print(f"✅ Completions logged to: {log_file_path}")
+    
+    # Calculate overall statistics
+    if all_completions:
+        all_completion_lengths = [len(comp.split()) for comp in all_completions]
+        overall_stats = {
+            'total_prompts_processed': len(all_prompts),
+            'total_unique_prompts': len(completion_groups),
+            'total_completions_generated': len(all_completions),
+            'avg_completion_length': sum(all_completion_lengths) / len(all_completion_lengths),
+            'min_completion_length': min(all_completion_lengths),
+            'max_completion_length': max(all_completion_lengths),
+            'batches_processed': len(batch_stats),
+            'log_file_path': log_file_path,
+            'reward_functions_used': reward_func_names if reward_funcs else []
+        }
+        
+        # Add reward statistics
+        if mean_reward_scores:
+            overall_stats['mean_rewards_per_function'] = {}
+            for func_name in reward_func_names:
+                all_scores = [scores[func_name] for scores in mean_reward_scores.values() if scores[func_name] is not None]
+                if all_scores:
+                    overall_stats['mean_rewards_per_function'][func_name] = {
+                        'mean': sum(all_scores) / len(all_scores),
+                        'min': min(all_scores),
+                        'max': max(all_scores)
+                    }
+    else:
+        overall_stats = {'log_file_path': log_file_path, 'reward_functions_used': reward_func_names if reward_funcs else []}
+    
+    if verbose:
+        print(f"\n✅ Rollout demo complete!")
+        if overall_stats:
+            print(f"\n📈 Overall Statistics:")
+            print(f"  Total prompts processed: {overall_stats['total_prompts_processed']}")
+            print(f"  Unique prompts: {overall_stats['total_unique_prompts']}")
+            print(f"  Total completions: {overall_stats['total_completions_generated']}")
+            print(f"  Average completion length: {overall_stats['avg_completion_length']:.1f} words")
+            
+            if 'mean_rewards_per_function' in overall_stats:
+                print(f"\n🏆 Reward Function Results:")
+                for func_name, stats in overall_stats['mean_rewards_per_function'].items():
+                    print(f"  {func_name}: mean={stats['mean']:.3f}, min={stats['min']:.3f}, max={stats['max']:.3f}")
+        
+        print(f"\n🔑 Key Insights:")
+        print(f"  • RepeatSampler created {num_generations} copies of each prompt")
+        print(f"  • Single model.generate() call processed all duplicates")
+        print(f"  • Sampling diversity from temperature={temperature}, top_p={top_p}")
+        if reward_funcs:
+            print(f"  • Computed rewards using {len(reward_func_names)} reward functions")
+        print(f"  • This mimics GRPO's efficient batch generation strategy")
+    
+    return {
+        'prompts': all_prompts,
+        'completions': all_completions,
+        'completion_groups': completion_groups,
+        'reward_scores': mean_reward_scores,  # Mean rewards per unique prompt
+        'stats': overall_stats,
+        'batch_stats': batch_stats,
+        'log_file_path': log_file_path
+    }
+
+
+def _calculate_rewards(
+    prompt: str,
+    completions: List[str],
+    reward_funcs: List[RewardFunc],
+    reward_func_names: List[str],
+    inputs: Optional[List[Dict[str, Any]]] = None,
+    completion_ids_list: Optional[List[torch.Tensor]] = None,
+    verbose: bool = False
+) -> Dict[str, float]:
+    """
+    Calculate rewards for completions using the provided reward functions.
+    Similar to GRPO's _calculate_rewards method.
+    """
+    
+    rewards_per_func = {}
+    
+    # Prepare reward kwargs similar to reference implementation
+    reward_kwargs = {}
+    if inputs is not None:
+        # Extract all input columns except "prompt", "completion", and "completion_ids"
+        keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+        reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+    
+    for i, (reward_func, reward_func_name) in enumerate(
+        zip(reward_funcs, reward_func_names)
+    ):
+        try:
+            # Custom callable reward function - pass additional parameters like reference
+            output_rewards = reward_func(
+                prompts=[prompt] * len(completions),
+                completions=completions,
+                completion_ids=completion_ids_list,
+                **reward_kwargs
+            )
+            
+            # Handle None values
+            valid_rewards = [r for r in output_rewards if r is not None]
+            if valid_rewards:
+                mean_reward = sum(valid_rewards) / len(valid_rewards)
+            else:
+                mean_reward = None
+                
+            rewards_per_func[reward_func_name] = mean_reward
+            
+        except Exception as e:
+            breakpoint()
+            if verbose:
+                print(f"⚠️  Error computing reward with {reward_func_name}: {e}")
+            rewards_per_func[reward_func_name] = None
+    
+    return rewards_per_func
+
+
+def _log_completions_to_file(
+    prompt: str, 
+    completions: List[str], 
+    log_file_path: str, 
+    log_format: str, 
+    batch_idx: int,
+    log_data: Optional[Dict] = None,
+    reward_scores: Optional[Dict[str, float]] = None
+):
+    """Helper function to log completions to file in the specified format."""
+    
+    if log_format == "jsonl":
+        # Append each completion as a separate JSON line
+        with open(log_file_path, 'a', encoding='utf-8') as f:
+            for i, completion in enumerate(completions):
+                entry = {
+                    "batch_idx": batch_idx,
+                    "prompt": prompt,
+                    "completion_idx": i,
+                    "completion": completion,
+                    "timestamp": datetime.now().isoformat(),
+                    "completion_length_words": len(completion.split()),
+                    "completion_length_chars": len(completion)
+                }
+                if reward_scores:
+                    entry["reward_scores"] = reward_scores
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    
+    elif log_format == "json":
+        # Add to the main log_data structure
+        if log_data is not None:
+            for i, completion in enumerate(completions):
+                entry = {
+                    "batch_idx": batch_idx,
+                    "prompt": prompt,
+                    "completion_idx": i,
+                    "completion": completion,
+                    "timestamp": datetime.now().isoformat(),
+                    "completion_length_words": len(completion.split()),
+                    "completion_length_chars": len(completion)
+                }
+                if reward_scores:
+                    entry["reward_scores"] = reward_scores
+                log_data["completions"].append(entry)
+    
+    elif log_format == "txt":
+        # Append in human-readable text format
+        with open(log_file_path, 'a', encoding='utf-8') as f:
+            f.write(f"BATCH {batch_idx + 1}\n")
+            f.write(f"PROMPT: {prompt}\n")
+            if reward_scores:
+                f.write(f"REWARDS: {reward_scores}\n")
+            f.write("-" * 60 + "\n")
+            for i, completion in enumerate(completions):
+                f.write(f"COMPLETION {i + 1}: {completion}\n")
+                f.write(f"Length: {len(completion.split())} words, {len(completion)} chars\n\n")
+            f.write("=" * 80 + "\n\n")
+
+
+def create_sample_dataset() -> Dataset:
+    """Create a simple dataset for demonstration purposes."""
+    prompts = [
+        "What is the capital of France?",
+        "Explain quantum physics in simple terms.",
+        "Write a short poem about nature.",
+        "How do neural networks work?",
+        "What are the benefits of exercise?"
+    ]
+    
+    return Dataset.from_dict({"prompt": prompts})
+
+
+# Example usage
+def main():
+    """Example usage of the grpo_rollout_demo function."""
+    
+    # Load a small model for demo
+    model_name = "microsoft/DialoGPT-small"
+    
+    print("Loading model and tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    
+    # Create sample dataset
+    dataset = create_sample_dataset()
+    
+    # Run the demo with reward functions
+    results = grpo_rollout_demo(
+        dataset=dataset,
+        model=model,
+        tokenizer=tokenizer,
+        prompt_column="prompt",
+        num_generations=4,
+        per_device_batch_size=1,
+        steps_per_generation=2,
+        max_completion_length=30,
+        temperature=0.8,
+        max_batches=2,
+        verbose=True,
+        log_file="demo_completions.jsonl",  # Specify log file
+        log_format="jsonl",  # Can be "jsonl", "json", or "txt"
+        reward_funcs=[simple_length_reward],  # Add reward functions
+    )
+    
+    # Access results
+    print(f"\n📊 Summary:")
+    print(f"Processed {results['stats']['total_unique_prompts']} unique prompts")
+    print(f"Generated {results['stats']['total_completions_generated']} total completions")
+    
+    # Show reward scores for each prompt
+    if results['reward_scores']:
+        print(f"\n🏆 Reward Scores by Prompt:")
+        for prompt, scores in results['reward_scores'].items():
+            print(f"'{prompt[:50]}...': {scores}")
+    
+    # Example: Get all completions for first prompt
+    first_prompt = list(results['completion_groups'].keys())[0]
+    first_prompt_completions = results['completion_groups'][first_prompt]
+    print(f"\nFirst prompt: '{first_prompt}'")
+    print(f"Generated {len(first_prompt_completions)} completions for this prompt")
+    
+    if results['reward_scores'] and first_prompt in results['reward_scores']:
+        print(f"Mean rewards: {results['reward_scores'][first_prompt]}")
+
+def simple_length_reward(completions: List[str], **kwargs) -> List[float]:
+    """
+    Simple reward function that rewards longer completions.
+    Returns a reward proportional to the length of the completion in words.
+    """
+    rewards = []
+    for completion in completions:
+        word_count = len(completion.split())
+        # Simple linear reward based on word count, normalized to [0, 1] range
+        # Assume max reasonable length is 100 words for normalization
+    
+        reward = 5/max(5, word_count) if word_count >= 5 else 5/(5+(5 - word_count))
+        rewards.append(reward)
+    return rewards
+
+
+if __name__ == "__main__":
+    main()
