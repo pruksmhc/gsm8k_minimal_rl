@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Utils function for demonstrating GRPO RepeatSampler with any HuggingFace dataset,
-model, and tokenizer.
+Utils function for rolling out with any HuggingFace dataset,
+model, and tokenizer. Good for evaluating at each checkpoint, the diversity of generations.
 """
 
 import torch
@@ -34,7 +34,7 @@ def _setup_logging(
     if log_file is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = getattr(model.config, '_name_or_path', 'unknown_model').split('/')[-1]
-        log_file = f"grpo_completions_{model_name}_{timestamp}.{log_format}"
+        log_file = f"rollout_completions_{model_name}_{timestamp}.{log_format}"
     
     log_file_path = os.path.abspath(log_file)
     
@@ -63,7 +63,6 @@ def _setup_logging(
         }
     elif log_format == "txt":
         with open(log_file_path, 'w', encoding='utf-8') as f:
-            f.write(f"GRPO Completions Log\n")
             f.write(f"Model: {getattr(model.config, '_name_or_path', 'unknown_model')}\n")
             f.write(f"Timestamp: {datetime.now().isoformat()}\n")
             f.write("=" * 80 + "\n\n")
@@ -96,8 +95,7 @@ def _create_sampler_and_dataloader(
     seed: int, 
     verbose: bool
 ) -> DataLoader:
-    """Create RepeatSampler and DataLoader for GRPO rollout."""
-    # Create RepeatSampler (the core GRPO component)
+    """Create RepeatSampler and DataLoader for rollout."""
     sampler = RepeatSampler(
         data_source=dataset,
         mini_repeat_count=num_generations,      # Repeat each prompt num_generations times
@@ -110,11 +108,10 @@ def _create_sampler_and_dataloader(
     if verbose:
         print(f"RepeatSampler will produce {len(sampler)} total samples")
     
-    # Create DataLoader with GRPO's modified batch size
     generation_batch_size = per_device_batch_size * steps_per_generation
     dataloader = DataLoader(
         dataset,
-        batch_size=generation_batch_size * num_generations,  # Key GRPO modification
+        batch_size=generation_batch_size * num_generations,  
         sampler=sampler,
         collate_fn=lambda x: x  # No collation, keep as list
     )
@@ -170,7 +167,7 @@ def _process_batch(
             formatted_prompts,
             return_tensors="pt",
             padding=True,
-            padding_side="left",  # GRPO uses left padding
+            padding_side="left", 
             truncation=True,
             add_special_tokens=False
         )
@@ -180,7 +177,7 @@ def _process_batch(
             maybe_conversational_prompts,
             return_tensors="pt",
             padding=True,
-            padding_side="left",  # GRPO uses left padding
+            padding_side="left", 
             truncation=True,
             add_special_tokens=False
         )
@@ -335,7 +332,7 @@ def _finalize_stats_and_logging(
     return overall_stats, mean_reward_scores
 
 
-def grpo_rollout_demo(
+def rollout_eval(
     dataset: Dataset,
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -355,16 +352,15 @@ def grpo_rollout_demo(
     reward_funcs: Optional[Union[RewardFunc, List[RewardFunc]]] = None,
 ) -> Dict[str, Any]:
     """
-    Demonstrate GRPO rollout strategy using RepeatSampler.
     
     Args:
         dataset: HuggingFace Dataset containing prompts
         model: Pre-trained causal language model
         tokenizer: Tokenizer corresponding to the model
         prompt_column: Column name containing prompts in the dataset
-        num_generations: Number of completions per prompt (like GRPO's num_generations)
-        per_device_batch_size: Batch size per device (like GRPO's per_device_train_batch_size)
-        steps_per_generation: Number of training steps per generation (like GRPO's steps_per_generation)
+        num_generations: Number of completions per prompt 
+        per_device_batch_size: Batch size per device 
+        steps_per_generation: Number of training steps per generation 
         max_completion_length: Maximum length of generated completions
         temperature: Sampling temperature for generation
         top_p: Nucleus sampling parameter
@@ -386,7 +382,6 @@ def grpo_rollout_demo(
     """
     
     if verbose:
-        print("🚀 GRPO RepeatSampler Rollout Demo")
         print(f"Dataset size: {len(dataset)}")
         print(f"Num generations per prompt: {num_generations}")
         print(f"Steps per generation: {steps_per_generation}")
@@ -537,7 +532,6 @@ def grpo_rollout_demo(
         print(f"  • Sampling diversity from temperature={temperature}, top_p={top_p}")
         if reward_funcs:
             print(f"  • Computed rewards using {len(reward_func_names)} reward functions")
-        print(f"  • This mimics GRPO's efficient batch generation strategy")
     
     return {
         'prompts': all_prompts,
@@ -665,7 +659,6 @@ def create_sample_dataset() -> Dataset:
 
 # Example usage
 def main():
-    """Example usage of the grpo_rollout_demo function."""
     
     # Load a small model for demo
     model_name = "microsoft/DialoGPT-small"
@@ -678,7 +671,7 @@ def main():
     dataset = create_sample_dataset()
     
     # Run the demo with reward functions
-    results = grpo_rollout_demo(
+    results = rollout_eval(
         dataset=dataset,
         model=model,
         tokenizer=tokenizer,

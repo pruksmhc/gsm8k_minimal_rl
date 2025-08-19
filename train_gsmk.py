@@ -169,7 +169,7 @@ def run_grpo_rollout_on_gsm8k(
         max_batches: Maximum number of batches to process
         verbose: Whether to print detailed information
     """
-    from generate_rollouts import grpo_rollout_demo
+    from generate_rollouts import rollout_eval
     
     print("🚀 Running GRPO Rollout Demo on GSM8K Test Dataset")
     
@@ -178,7 +178,7 @@ def run_grpo_rollout_on_gsm8k(
     gsm8k_dataset = get_gsm8k_questions(split="test")
     
     # Run the rollout demo
-    results = grpo_rollout_demo(
+    results = rollout_eval(
         dataset=gsm8k_dataset,
         model=model,
         tokenizer=tokenizer,
