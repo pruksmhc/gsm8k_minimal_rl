@@ -9,7 +9,6 @@ import torch
 import argparse
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 
 # Load and prep dataset
@@ -32,105 +31,6 @@ XML_COT_FORMAT = """\
 {answer}
 </answer>
 """
-
-def evaluate_model_from_checkpoint(checkpoint_dir):
-    """
-    Evaluate a model from a checkpoint directory.
-    
-    Args:
-        checkpoint_dir: Path to the checkpoint directory containing the saved model
-        model_name: Base model name to use if not loading from checkpoint
-    """
-    print(f"Loading model from checkpoint: {checkpoint_dir}")
-    
-    # Load model and tokenizer from checkpoint
-    if os.path.exists(os.path.join(checkpoint_dir, "pytorch_model.bin")) or \
-       os.path.exists(os.path.join(checkpoint_dir, "model.safetensors")):
-        # Load from checkpoint
-        model = AutoModelForCausalLM.from_pretrained(
-            checkpoint_dir,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map=None
-        ).to("cuda")
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
-    else:
-        raise ValueError("Invalid checkpoint dir!")
-    
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    test_dataset = get_gsm8k_questions(split="test")
-
-    # Set batch size
-    BATCH_SIZE = 8
-
-    # Prepare prompts as strings
-    def prompt_to_text(prompt):
-        if isinstance(prompt, list):
-            prompt_text = ""
-            for msg in prompt:
-                if msg["role"] == "system":
-                    prompt_text += msg["content"].strip() + "\n"
-                elif msg["role"] == "user":
-                    prompt_text += "Question: " + msg["content"].strip() + "\n"
-                elif msg["role"] == "assistant":
-                    prompt_text += msg["content"].strip() + "\n"
-            return prompt_text.strip()
-        else:
-            return str(prompt)
-
-    prompts = [prompt_to_text(ex["prompt"]) for ex in test_dataset]
-    reference_answers = [ex["answer"] for ex in test_dataset]
-
-    predictions = []
-    print(f"Evaluating on {len(prompts)} test examples...")
-    
-    for i in range(0, len(prompts), BATCH_SIZE):
-        batch_prompts = prompts[i:i+BATCH_SIZE]
-        batch_refs = reference_answers[i:i+BATCH_SIZE]
-        
-        if (i // BATCH_SIZE) % 10 == 0:
-            print(f"Processing batch {i//BATCH_SIZE + 1}/{len(prompts)//BATCH_SIZE + 1}")
-        
-        # Tokenize batch
-        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
-        # Generate
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=128,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        # For each output in batch
-        for j in range(len(batch_prompts)):
-            input_len = (inputs["input_ids"][j] != tokenizer.pad_token_id).sum().item()
-            generated = tokenizer.decode(outputs[j][input_len:], skip_special_tokens=True)
-            extracted = extract_xml_answer(generated)
-            predictions.append({
-                "question": batch_prompts[j],
-                "reference_answer": batch_refs[j],
-                "generated": generated,
-                "extracted_answer": extracted,
-            })
-
-    # Calculate accuracy
-    correct = sum(1 for pred in predictions if pred["extracted_answer"] == pred["reference_answer"])
-    accuracy = correct / len(predictions)
-    print(f"Accuracy: {accuracy:.4f} ({correct}/{len(predictions)})")
-
-    # Save predictions to disk as JSONL
-    import json
-    output_file = os.path.join(checkpoint_dir, "gsm8k_test_predictions.jsonl")
-    with open(output_file, "w") as f:
-        for pred in predictions:
-            f.write(json.dumps(pred) + "\n")
-    
-    print(f"Predictions saved to: {output_file}")
-    return accuracy
 
 
 def extract_xml_answer(text: str) -> str:
@@ -206,7 +106,7 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     contents = [completion[0]["content"] for completion in completions]
     return [count_xml(c) for c in contents]
 
-def train_model_from_scratch(model_name=None, output_dir=None):
+def train_model_from_scratch(model, tokenizer, output_dir=None, per_device_train_batch_size: int = 32):
     dataset = get_gsm8k_questions()
     
     if model_name is None:
@@ -233,7 +133,7 @@ def train_model_from_scratch(model_name=None, output_dir=None):
         lr_scheduler_type='cosine',
         logging_steps=1,
         bf16=True,
-        per_device_train_batch_size=32, # in h100 
+        per_device_train_batch_size=per_device_train_batch_size, # in h100 
         gradient_accumulation_steps=8,
         num_generations=16,
         max_prompt_length=256,
@@ -244,15 +144,6 @@ def train_model_from_scratch(model_name=None, output_dir=None):
         report_to="wandb",
         log_on_each_node=False,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map=None
-    ).to("cuda")
-            
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
 
     trainer = GRPOTrainer(
         model=model,
@@ -270,8 +161,8 @@ def train_model_from_scratch(model_name=None, output_dir=None):
 
 
 def run_grpo_rollout_on_gsm8k(
-    model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
-    checkpoint_dir: str = None,
+    model, 
+    tokenizer,
     num_generations: int = 4,
     per_device_batch_size: int = 1,
     steps_per_generation: int = 2,
@@ -298,29 +189,6 @@ def run_grpo_rollout_on_gsm8k(
     from generate_rollouts import grpo_rollout_demo, simple_length_reward
     
     print("🚀 Running GRPO Rollout Demo on GSM8K Test Dataset")
-    
-    # Load model and tokenizer
-    if checkpoint_dir and os.path.exists(checkpoint_dir):
-        print(f"Loading model from checkpoint: {checkpoint_dir}")
-        model = AutoModelForCausalLM.from_pretrained(
-            checkpoint_dir,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map=None
-        ).to("cuda")
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
-    else:
-        print(f"Loading model: {model_name}")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map=None
-        ).to("cuda")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
     
     # Load GSM8K test dataset
     print("Loading GSM8K test dataset...")
@@ -393,21 +261,42 @@ def main():
                         help="Maximum number of batches for rollout mode")
     parser.add_argument("--num_generations", type=int, default=4,
                         help="Number of generations per prompt for rollout mode")
+    parser.add_argument("--per_device_batch_size", type=int, default=4,
+                        help="Number of per device batch size")
     
     args = parser.parse_args()
     
+        
+    # Load model and tokenizer
+    if args.checkpoint_dir and os.path.exists(args.checkpoint_dir):
+        print(f"Loading model from checkpoint: {args.checkpoint_dir}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.checkpoint_dir,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map=None
+        ).to("cuda")
+        tokenizer = AutoTokenizer.from_pretrained(args.checkpoint_dir)
+    else:
+        print(f"Loading model: {args.model_name}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map=None
+        ).to("cuda")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     if args.mode == "train":
         print("Starting training mode...")
-        train_model_from_scratch(model_name=args.model, output_dir=args.output_dir)
-    elif args.mode == "eval":
-        if not args.checkpoint:
-            parser.error("--checkpoint is required for evaluation mode")
-        print(f"Starting evaluation mode with checkpoint: {args.checkpoint}")
-        evaluate_model_from_checkpoint(args.checkpoint)
+        train_model_from_scratch(model, tokenizer, output_dir=args.output_dir)
     elif args.mode == "rollout":
         print("Starting GRPO rollout demo mode...")
         run_grpo_rollout_on_gsm8k(
-            model_name=args.model,
+            model, 
             checkpoint_dir=args.checkpoint,
             max_batches=args.max_batches,
             num_generations=args.num_generations,
