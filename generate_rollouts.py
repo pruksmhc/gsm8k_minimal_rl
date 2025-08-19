@@ -26,48 +26,21 @@ RewardFunc = Union[str, nn.Module, Callable[[List[str], List[str]], List[float]]
 
 def _setup_logging(
     log_file: Optional[str], 
-    log_format: str, 
     model: AutoModelForCausalLM, 
     verbose: bool
-) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """Setup logging file and return log file path and log data structure."""
+) -> str:
+    """Setup logging file and return log file path."""
     if log_file is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = getattr(model.config, '_name_or_path', 'unknown_model').split('/')[-1]
-        log_file = f"rollout_completions_{model_name}_{timestamp}.{log_format}"
+        log_file = f"rollout_completions_{model_name}_{timestamp}.jsonl"
     
     log_file_path = os.path.abspath(log_file)
     
     if verbose:
         print(f"📝 Logging completions to: {log_file_path}")
-        print(f"Log format: {log_format}")
     
-    # Validate log format
-    if log_format not in ["jsonl", "json", "txt"]:
-        raise ValueError(f"log_format must be one of ['jsonl', 'json', 'txt'], got '{log_format}'")
-    
-    # Initialize log file
-    log_data = None
-    if log_format == "json":
-        log_data = {
-            "metadata": {
-                "model_name": getattr(model.config, '_name_or_path', 'unknown_model'),
-                "timestamp": datetime.now().isoformat(),
-                "num_generations": None,  # Will be set by caller
-                "temperature": None,      # Will be set by caller
-                "top_p": None,           # Will be set by caller
-                "max_completion_length": None,  # Will be set by caller
-                "seed": None             # Will be set by caller
-            },
-            "completions": []
-        }
-    elif log_format == "txt":
-        with open(log_file_path, 'w', encoding='utf-8') as f:
-            f.write(f"Model: {getattr(model.config, '_name_or_path', 'unknown_model')}\n")
-            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-            f.write("=" * 80 + "\n\n")
-    
-    return log_file_path, log_data
+    return log_file_path
 
 
 def _setup_model_and_tokenizer(
@@ -130,8 +103,6 @@ def _process_batch(
     prompt_column: str, 
     prompt_id_column: str, 
     log_file_path: str, 
-    log_format: str, 
-    log_data: Optional[Dict[str, Any]], 
     verbose: bool
 ) -> Tuple[List[str], List[str], List[str], Dict[str, List[str]], Dict[str, Dict[str, float]]]:
     """Process a single batch of prompts and generate completions."""
@@ -244,9 +215,7 @@ def _process_batch(
             unique_prompt, 
             prompt_completions, 
             log_file_path, 
-            log_format, 
             batch_idx,
-            log_data if log_format == "json" else None,
             batch_reward_scores.get(unique_prompt, {})
         )
     
@@ -273,8 +242,6 @@ def _finalize_stats_and_logging(
     reward_funcs: Optional[List[RewardFunc]],
     batch_stats: List[Dict[str, Any]], 
     log_file_path: str, 
-    log_format: str, 
-    log_data: Optional[Dict[str, Any]], 
     verbose: bool
 ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
     """Calculate final statistics and finalize logging."""
@@ -289,13 +256,15 @@ def _finalize_stats_and_logging(
                 else:
                     mean_reward_scores[prompt][func_name] = None
     
-    # Finalize logging
-    if log_format == "json":
-        # Add reward summary to JSON log
-        if mean_reward_scores:
-            log_data["reward_summary"] = mean_reward_scores
-        with open(log_file_path, 'w', encoding='utf-8') as f:
-            json.dump(log_data, f, indent=2, ensure_ascii=False)
+    # Add reward summary to jsonl log if we have rewards
+    if mean_reward_scores:
+        reward_summary = {
+            "type": "reward_summary",
+            "timestamp": datetime.now().isoformat(),
+            "reward_summary": mean_reward_scores
+        }
+        with open(log_file_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(reward_summary, ensure_ascii=False) + '\n')
     
     if verbose:
         print(f"✅ Completions logged to: {log_file_path}")
@@ -348,7 +317,6 @@ def rollout_eval(
     max_batches: int = 1,
     verbose: bool = True,
     log_file: Optional[str] = None,
-    log_format: str = "jsonl",
     reward_funcs: Optional[Union[RewardFunc, List[RewardFunc]]] = None,
 ) -> Dict[str, Any]:
     """
@@ -368,7 +336,6 @@ def rollout_eval(
         max_batches: Maximum number of batches to process (for demo purposes)
         verbose: Whether to print detailed information
         log_file: Path to file for logging completions. If None, auto-generates filename
-        log_format: Format for logging ("jsonl", "json", or "txt")
         reward_funcs: Optional reward functions (str model path, nn.Module, or callable)
         
     Returns:
@@ -393,17 +360,21 @@ def rollout_eval(
         raise ValueError(f"Dataset must contain column '{prompt_column}'. Available columns: {dataset.column_names}")
     
     # Setup logging
-    log_file_path, log_data = _setup_logging(log_file, log_format, model, verbose)
+    log_file_path = _setup_logging(log_file, model, verbose)
     
-    # Update log metadata if JSON format
-    if log_format == "json" and log_data:
-        log_data["metadata"].update({
-            "num_generations": num_generations,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_completion_length": max_completion_length,
-            "seed": seed
-        })
+    # Write metadata as first line in jsonl format
+    metadata = {
+        "type": "metadata",
+        "model_name": getattr(model.config, '_name_or_path', 'unknown_model'),
+        "timestamp": datetime.now().isoformat(),
+        "num_generations": num_generations,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_completion_length": max_completion_length,
+        "seed": seed
+    }
+    with open(log_file_path, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(metadata, ensure_ascii=False) + '\n')
     
     # Setup model and tokenizer
     _setup_model_and_tokenizer(model, tokenizer, seed, verbose)
@@ -474,8 +445,6 @@ def rollout_eval(
                 prompt_column,
                 prompt_id_column,
                 log_file_path,
-                log_format,
-                log_data,
                 verbose
             )
             # Aggregate results across all batches
@@ -507,8 +476,6 @@ def rollout_eval(
         reward_funcs,
         batch_stats,
         log_file_path,
-        log_format,
-        log_data,
         verbose
     )
     
@@ -594,54 +561,24 @@ def _log_completions_to_file(
     prompt: str, 
     completions: List[str], 
     log_file_path: str, 
-    log_format: str, 
     batch_idx: int,
-    log_data: Optional[Dict] = None,
     reward_scores: Optional[Dict[str, float]] = None
 ):
-    """Helper function to log completions to file in the specified format."""
-    
-    if log_format == "jsonl":
-        # Append each completion as a separate JSON line
-        with open(log_file_path, 'a', encoding='utf-8') as f:
-            for i, completion in enumerate(completions):
-                entry = {
-                    "batch_idx": batch_idx,
-                    "prompt": prompt,
-                    "completion_idx": i,
-                    "completion": completion,
-                    "timestamp": datetime.now().isoformat(),
-                }
-                if reward_scores:
-                    entry["reward_scores"] = reward_scores
-                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-    
-    elif log_format == "json":
-        # Add to the main log_data structure
-        if log_data is not None:
-            for i, completion in enumerate(completions):
-                entry = {
-                    "batch_idx": batch_idx,
-                    "prompt": prompt,
-                    "completion_idx": i,
-                    "completion": completion,
-                    "timestamp": datetime.now().isoformat(),
-                }
-                if reward_scores:
-                    entry["reward_scores"] = reward_scores
-                log_data["completions"].append(entry)
-    
-    elif log_format == "txt":
-        # Append in human-readable text format
-        with open(log_file_path, 'a', encoding='utf-8') as f:
-            f.write(f"BATCH {batch_idx + 1}\n")
-            f.write(f"PROMPT: {prompt}\n")
+    """Helper function to log completions to file in jsonl format."""
+    # Append each completion as a separate JSON line
+    with open(log_file_path, 'a', encoding='utf-8') as f:
+        for i, completion in enumerate(completions):
+            entry = {
+                "type": "completion",
+                "batch_idx": batch_idx,
+                "prompt": prompt,
+                "completion_idx": i,
+                "completion": completion,
+                "timestamp": datetime.now().isoformat(),
+            }
             if reward_scores:
-                f.write(f"REWARDS: {reward_scores}\n")
-            f.write("-" * 60 + "\n")
-            for i, completion in enumerate(completions):
-                f.write(f"COMPLETION {i + 1}: {completion}\n")
-            f.write("=" * 80 + "\n\n")
+                entry["reward_scores"] = reward_scores
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
 
 def create_sample_dataset() -> Dataset:
@@ -685,7 +622,6 @@ def main():
         max_batches=2,
         verbose=True,
         log_file="demo_completions.jsonl",  # Specify log file
-        log_format="jsonl",  # Can be "jsonl", "json", or "txt"
         reward_funcs=[simple_length_reward],  # Add reward functions
     )
     

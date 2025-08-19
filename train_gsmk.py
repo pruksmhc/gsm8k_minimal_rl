@@ -191,7 +191,6 @@ def run_grpo_rollout_on_gsm8k(
         max_batches=max_batches,
         verbose=verbose,
         log_file=output_dir,
-        log_format="jsonl",
         reward_funcs=[correctness_reward_func, soft_format_reward_func],
     )
     
