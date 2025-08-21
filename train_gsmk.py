@@ -1,7 +1,8 @@
 """GSMK Training Script for GRPO
 
 Example usage:
-python3 train_gsmk.py --mode rollout --output_dir output --per_device_batch_size 64 # a40
+python3 train_gsmk.py --mode rollout --output_dir output --per_device_batch_size 64 --max_batches 10 # a40, trying on 10. 
+Don't pass in max_batches if you want to rollout across entire dataset. 
 """
 
 import os
@@ -12,6 +13,7 @@ import argparse
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOConfig, GRPOTrainer
+from generate_rollouts import rollout_eval
 
 # Load and prep dataset
 
@@ -169,7 +171,6 @@ def run_grpo_rollout_on_gsm8k(
         max_batches: Maximum number of batches to process
         verbose: Whether to print detailed information
     """
-    from generate_rollouts import rollout_eval
     
     print("🚀 Running GRPO Rollout Demo on GSM8K Test Dataset")
     
@@ -198,7 +199,6 @@ def run_grpo_rollout_on_gsm8k(
     print(f"📊 Summary:")
     print(f"  • Processed {results['stats']['total_unique_prompts']} unique prompts")
     print(f"  • Generated {results['stats']['total_completions_generated']} total completions")
-    print(f"  • Average completion length: {results['stats']['avg_completion_length']:.1f} words")
     
     if results['reward_scores']:
         print(f"\n🏆 Average Reward Scores:")
@@ -212,7 +212,7 @@ def run_grpo_rollout_on_gsm8k(
 
 def main():
     parser = argparse.ArgumentParser(description="Train or evaluate GRPO model on GSM8K")
-    parser.add_argument("--mode", choices=["train", "eval", "rollout"], required=True,
+    parser.add_argument("--mode", choices=["train", "rollout"], required=True,
                         help="Whether to train a new model, evaluate from checkpoint, or run rollout demo")
     parser.add_argument("--checkpoint", type=str,
                         help="Path to checkpoint directory for evaluation/rollout mode")
@@ -220,7 +220,7 @@ def main():
                         help="Model name for training/rollout mode")
     parser.add_argument("--output_dir", type=str,
                         help="Output directory for training mode")
-    parser.add_argument("--max_batches", type=int, default=10,
+    parser.add_argument("--max_batches", type=int,
                         help="Maximum number of batches for rollout mode")
     parser.add_argument("--num_generations", type=int, default=4,
                         help="Number of generations per prompt for rollout mode")

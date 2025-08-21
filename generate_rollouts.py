@@ -209,14 +209,22 @@ def _process_batch(
                 verbose=verbose
             )
             batch_reward_scores[unique_prompt] = prompt_rewards
-        
+        import hashlib
+
+        def _hash_prompt(prompt: str) -> str:
+            """Create a SHA256 hash for the prompt string."""
+            return hashlib.sha256(unique_prompt.encode("utf-8")).hexdigest()
+
+        prompt_hash = _hash_prompt(unique_prompt)
         # Log completions to file (now includes rewards if available)
         _log_completions_to_file(
             unique_prompt, 
             prompt_completions, 
+            prompt_hash,
+            [b["answer"] for b in batch_examples],
             log_file_path, 
             batch_idx,
-            batch_reward_scores.get(unique_prompt, {})
+            batch_reward_scores.get(unique_prompt, {}), 
         )
     
     if verbose:
@@ -271,14 +279,10 @@ def _finalize_stats_and_logging(
     
     # Calculate overall statistics
     if all_completions:
-        all_completion_lengths = [len(comp.split()) for comp in all_completions]
         overall_stats = {
             'total_prompts_processed': len(all_prompts),
             'total_unique_prompts': len(completion_groups),
             'total_completions_generated': len(all_completions),
-            'avg_completion_length': sum(all_completion_lengths) / len(all_completion_lengths),
-            'min_completion_length': min(all_completion_lengths),
-            'max_completion_length': max(all_completion_lengths),
             'batches_processed': len(batch_stats),
             'log_file_path': log_file_path,
             'reward_functions_used': reward_func_names if reward_funcs else []
@@ -314,7 +318,7 @@ def rollout_eval(
     temperature: float = 0.8,
     top_p: float = 0.9,
     seed: int = 42,
-    max_batches: int = 1,
+    max_batches: Optional[int] = None,
     verbose: bool = True,
     log_file: Optional[str] = None,
     reward_funcs: Optional[Union[RewardFunc, List[RewardFunc]]] = None,
@@ -425,7 +429,7 @@ def rollout_eval(
     model.eval()
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            if batch_idx >= max_batches:
+            if max_batches and batch_idx >= max_batches:
                 break
             # Call _process_batch and collect outputs for aggregation
             (
@@ -486,7 +490,6 @@ def rollout_eval(
             print(f"  Total prompts processed: {overall_stats['total_prompts_processed']}")
             print(f"  Unique prompts: {overall_stats['total_unique_prompts']}")
             print(f"  Total completions: {overall_stats['total_completions_generated']}")
-            print(f"  Average completion length: {overall_stats['avg_completion_length']:.1f} words")
             
             if 'mean_rewards_per_function' in overall_stats:
                 print(f"\n🏆 Reward Function Results:")
@@ -560,12 +563,13 @@ def _calculate_rewards(
 def _log_completions_to_file(
     prompt: str, 
     completions: List[str], 
+    prompt_hash: str, 
+    answer: str,
     log_file_path: str, 
     batch_idx: int,
     reward_scores: Optional[Dict[str, float]] = None
 ):
-    """Helper function to log completions to file in jsonl format."""
-    # Append each completion as a separate JSON line
+    """Log completions to file in jsonl format."""
     with open(log_file_path, 'a', encoding='utf-8') as f:
         for i, completion in enumerate(completions):
             entry = {
@@ -574,10 +578,11 @@ def _log_completions_to_file(
                 "prompt": prompt,
                 "completion_idx": i,
                 "completion": completion,
-                "timestamp": datetime.now().isoformat(),
+                "answer": answer[i],
+                "prompt_hash": prompt_hash
             }
             if reward_scores:
-                entry["reward_scores"] = reward_scores
+                entry["reward_scores"] = {rs: reward_scores[rs][i] for rs in reward_scores.keys()}
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
 
@@ -656,6 +661,7 @@ def simple_length_reward(completions: List[str], **kwargs) -> List[float]:
         reward = 5/max(5, word_count) if word_count >= 5 else 5/(5+(5 - word_count))
         rewards.append(reward)
     return rewards
+
 
 
 if __name__ == "__main__":
