@@ -1,4 +1,5 @@
 """GSMK Training Script for GRPO
+Extended from willccbb's implementation. 
 
 Example usage:
 python3 train_gsmk.py --mode rollout --output_dir output --per_device_batch_size 64 --max_batches 10 # a40, trying on 10. 
