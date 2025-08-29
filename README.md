@@ -23,7 +23,7 @@ Wandb run with per device batch size of 8 and 16 generation (slower convergence 
 Notes: 
 * For RepeatSampler, it will repeat an item contiguously within a batch. Effective generation batch size is larger than per_device_batch_size * num_devices.  
 
-At checkpoint=200 steps, 62.65% of the examples have at least 4/8 generations correct, with temperature=0.8. This is in the ballpark of numbers reported in the Qwen2.5 paper. 
+At checkpoint=200 steps, 62.65% of the examples have at least 4/8 generations correct, with temperature=0.8. This is still lower than what I would expect given what is reported in the Qwen2.5 paper (68.5 for 1.5B base model), so need to try training for more epochs/figuring out how to get to a more reasonable performance. 
 
 TODO: 
 * Use a different sampler than RepeatSampler for rollouts. For GSM8K evals, with RepeatSampler, batch size must divide 1319 (test set size), otherwise RepeatSampler will drop the last remainder. 
